@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Only permission this app ever requests. No INTERNET permission is
+         declared anywhere in this manifest — the app is offline by design,
+         not just by policy, so it is physically incapable of phoning home. -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS"/>
+
+    <application
+        android:label="Expense Tracker"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
+        <!--
+          Manifest-declared receiver for the protected SMS_RECEIVED broadcast.
+          This is what lets the app react to new SMS WITHOUT any foreground
+          service, WorkManager polling, or the app being open — Android
+          exempts manifest receivers listening to protected system broadcasts
+          from the background-execution limits introduced in Android 8+.
+
+          android:permission="BROADCAST_SMS" is a security guardrail: only
+          the system (which holds BROADCAST_SMS) is allowed to trigger this
+          receiver, so a malicious third-party app cannot forge a fake SMS
+          broadcast to inject fabricated expense entries.
+        -->
+        <receiver
+            android:name=".SmsReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
