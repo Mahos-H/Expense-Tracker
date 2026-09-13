@@ -1,20 +1,18 @@
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import '../models/diagnostics_info.dart';
 import '../models/entry.dart';
 import '../models/failed_parse.dart';
 import '../models/parser_settings.dart';
 import '../models/rename_rule.dart';
 
-/// Opens the SAME database file (same name, same default location) that the
-/// native Kotlin SmsReceiver writes to directly. Schema here MUST stay in
-/// sync with android/.../ExpenseDbHelper.kt.
 class DbHelper {
   DbHelper._internal();
   static final DbHelper instance = DbHelper._internal();
 
   static const String dbName = 'expense_tracker.db';
-  static const int dbVersion = 2;
+  static const int dbVersion = 3;
   static const int maxEntries = 200;
 
   Database? _db;
@@ -68,11 +66,12 @@ class DbHelper {
             message_regex TEXT NOT NULL
           )
         ''');
-        await _seedDefaults(database);
-      },
-      onOpen: (database) async {
-        await database.rawQuery('PRAGMA busy_timeout=5000;');
-        // Idempotent: safe even if the native receiver created the DB first.
+        await database.execute('''
+          CREATE TABLE IF NOT EXISTS diagnostics (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          )
+        ''');
         await _seedDefaults(database);
       },
       onUpgrade: (database, oldVersion, newVersion) async {
@@ -85,6 +84,18 @@ class DbHelper {
             )
           ''');
         }
+        if (oldVersion < 3) {
+          await database.execute('''
+            CREATE TABLE IF NOT EXISTS diagnostics (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+          ''');
+        }
+      },
+      onOpen: (database) async {
+        await database.rawQuery('PRAGMA busy_timeout=5000;');
+        await _seedDefaults(database);
       },
     );
   }
@@ -141,8 +152,6 @@ class DbHelper {
     return rows.map((r) => ExpenseEntry.fromMap(r)).toList();
   }
 
-  /// All entries (including the anchor), oldest first — used by the trend
-  /// chart to build a running cumulative total over time.
   Future<List<ExpenseEntry>> getAllEntriesAscending() async {
     final database = await db;
     final rows = await database.query('entries', orderBy: 'entry_date ASC, id ASC');
@@ -169,9 +178,6 @@ class DbHelper {
     await database.update('entries', map, where: 'id = ?', whereArgs: [entry.id]);
   }
 
-  /// Plain user-initiated delete. Deliberately does NOT fold the amount into
-  /// Previous Expense — that folding only happens for automatic cap pruning.
-  /// A manual delete means "this entry should never have existed."
   Future<void> deleteEntry(int id) async {
     final database = await db;
     await database.delete(
@@ -204,10 +210,21 @@ class DbHelper {
 
     final placeholders = List.filled(ids.length, '?').join(',');
     await txn.rawDelete('DELETE FROM entries WHERE id IN ($placeholders)', ids);
-    await txn.rawUpdate(
+    final rowsUpdated = await txn.rawUpdate(
       'UPDATE entries SET amount = amount + ? WHERE is_previous_expense = 1',
       [foldedAmount],
     );
+    if (rowsUpdated == 0) {
+      final nowIso = DateTime.now().toIso8601String().split('.').first;
+      await txn.insert('entries', {
+        'amount': foldedAmount,
+        'receiver': 'Previous Expense',
+        'entry_date': nowIso,
+        'source': 'system',
+        'created_at': nowIso,
+        'is_previous_expense': 1,
+      });
+    }
   }
 
   // ---------------- Rename rules ----------------
@@ -283,6 +300,28 @@ class DbHelper {
       ParserSettings.defaultSenderMarker,
       ParserSettings.defaultMessageRegex,
     );
+  }
+
+  // ---------------- Diagnostics ----------------
+
+  /// Read-only from the Dart side -- only the native receiver writes to
+  /// this table. Lets you check whether the receiver has run recently at
+  /// all, independent of whether parsing succeeded.
+  Future<DiagnosticsInfo> getDiagnostics() async {
+    final database = await db;
+    final rows = await database.query('diagnostics');
+    DateTime? lastBroadcastAt;
+    int totalBroadcasts = 0;
+    for (final row in rows) {
+      final key = row['key'] as String;
+      final value = row['value'] as String;
+      if (key == 'last_broadcast_at') {
+        lastBroadcastAt = DateTime.tryParse(value);
+      } else if (key == 'total_broadcasts') {
+        totalBroadcasts = int.tryParse(value) ?? 0;
+      }
+    }
+    return DiagnosticsInfo(lastBroadcastAt: lastBroadcastAt, totalBroadcasts: totalBroadcasts);
   }
 
   String _iso(DateTime d) => d.toIso8601String().split('.').first;

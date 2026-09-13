@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../db/db_helper.dart';
+import '../models/diagnostics_info.dart';
 import '../models/parser_settings.dart';
 
 class ParserSettingsScreen extends StatefulWidget {
@@ -19,6 +21,7 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
   String? _testReceiver;
   String? _testError;
   bool _loading = true;
+  DiagnosticsInfo? _diagnostics;
 
   @override
   void initState() {
@@ -28,9 +31,15 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
 
   Future<void> _load() async {
     final settings = await DbHelper.instance.getParserSettings();
+    final diagnostics = await DbHelper.instance.getDiagnostics();
     _senderController.text = settings.senderMarker;
     _regexController.text = settings.messageRegex;
-    if (mounted) setState(() => _loading = false);
+    if (mounted) {
+      setState(() {
+        _diagnostics = diagnostics;
+        _loading = false;
+      });
+    }
   }
 
   @override
@@ -121,6 +130,49 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
     }
   }
 
+  Widget _diagnosticsCard() {
+    final d = _diagnostics;
+    final lastBroadcast = d?.lastBroadcastAt;
+    final ageText = lastBroadcast == null
+        ? 'never (since this install, or since the app was last force-stopped)'
+        : DateFormat('dd MMM yyyy, hh:mm:ss a').format(lastBroadcast);
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('Receiver diagnostics', style: TextStyle(fontWeight: FontWeight.w600)),
+                IconButton(
+                  icon: const Icon(Icons.refresh, size: 20),
+                  tooltip: 'Refresh',
+                  onPressed: _load,
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text('Last SMS broadcast received: $ageText'),
+            Text('Total broadcasts handled since install: ${d?.totalBroadcasts ?? 0}'),
+            const SizedBox(height: 8),
+            const Text(
+              "If a bank SMS lands in your inbox but this timestamp doesn't move at "
+              "roughly the same moment, the phone's OS never delivered it to this app — "
+              'check your battery optimization / autostart settings for this app, since '
+              "that's a phone-level restriction, not something this app can fix on its "
+              'own. If the timestamp DOES update but the transaction still never shows '
+              "up anywhere (including Unparsed Messages), that's worth reporting as a bug.",
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -142,6 +194,8 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
                 key: _formKey,
                 child: ListView(
                   children: [
+                    _diagnosticsCard(),
+                    const SizedBox(height: 16),
                     const Text(
                       'Controls which incoming SMS get auto-tracked, and how they\'re '
                       'parsed. The sender check is a simple "contains" match. The pattern '

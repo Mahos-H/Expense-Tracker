@@ -11,26 +11,14 @@ import java.util.Locale
 
 data class ParserSettings(val senderMarker: String, val messageRegex: String)
 
-/**
- * This helper opens the EXACT same SQLite file that sqflite opens on the
- * Dart side (same filename, same default "databases" directory), so the
- * receiver can write new entries even when the Flutter engine isn't running,
- * and Flutter picks them up next time it queries.
- *
- * Both sides use `CREATE TABLE IF NOT EXISTS`, so whichever side happens to
- * touch the database first (usually Flutter, since the user must open the
- * app once to grant RECEIVE_SMS) creates the schema safely; the other side
- * is a no-op on create.
- */
 class ExpenseDbHelper private constructor(context: Context) :
     SQLiteOpenHelper(context.applicationContext, DB_NAME, null, DB_VERSION) {
 
     companion object {
         const val DB_NAME = "expense_tracker.db"
-        const val DB_VERSION = 2
+        const val DB_VERSION = 3
         const val MAX_ENTRIES = 200
 
-        // Kept identical to the Dart-side defaults in models/parser_settings.dart.
         const val DEFAULT_SENDER_MARKER = "HDFCBK"
         const val DEFAULT_MESSAGE_REGEX =
             """Sent\s+(?:Rs\.?|INR)?\s*([0-9][0-9,]*\.\d{2})\s+From\s+HDFC\s+Bank\s+A/?C\s+\S+\s+To\s+(.+?)\s+On\s+(\d{1,2}/\d{1,2}/\d{2,4})"""
@@ -62,7 +50,6 @@ class ExpenseDbHelper private constructor(context: Context) :
             )
             """.trimIndent()
         )
-
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS rename_rules (
@@ -72,7 +59,6 @@ class ExpenseDbHelper private constructor(context: Context) :
             )
             """.trimIndent()
         )
-
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS failed_parses (
@@ -84,13 +70,20 @@ class ExpenseDbHelper private constructor(context: Context) :
             )
             """.trimIndent()
         )
-
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS parser_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 sender_marker TEXT NOT NULL,
                 message_regex TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS diagnostics (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
             """.trimIndent()
         )
@@ -110,15 +103,20 @@ class ExpenseDbHelper private constructor(context: Context) :
                 """.trimIndent()
             )
         }
+        if (oldVersion < 3) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS diagnostics (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """.trimIndent()
+            )
+        }
     }
 
     override fun onOpen(db: SQLiteDatabase) {
         super.onOpen(db)
-        // busy_timeout matters here: the receiver and the Flutter engine
-        // both live in the SAME process but can hit the DB from different
-        // threads at nearly the same moment (e.g. app opened right as an
-        // SMS arrives). Rather than fail with "database is locked", each
-        // writer waits up to 5s for the other's transaction to finish.
         db.rawQuery("PRAGMA busy_timeout=5000;", null).close()
         seedDefaults(db)
     }
@@ -168,9 +166,6 @@ class ExpenseDbHelper private constructor(context: Context) :
         return result
     }
 
-    /** Reads the current sender filter + message regex, editable from the app's
-     * Parser Settings screen. Falls back to the built-in HDFC defaults if the
-     * row is somehow missing. */
     fun getParserSettings(): ParserSettings {
         val cursor = readableDatabase.rawQuery(
             "SELECT sender_marker, message_regex FROM parser_settings WHERE id = 1 LIMIT 1", null
@@ -184,15 +179,48 @@ class ExpenseDbHelper private constructor(context: Context) :
         return result
     }
 
+    /** Records that the broadcast receiver actually ran, regardless of what
+     * happened afterward -- this is the single fact that lets you tell
+     * "the OS never delivered the SMS to this app" apart from "it arrived
+     * but something downstream went wrong." Wrapped in its own try/catch so
+     * a diagnostics failure can never take down the real parsing logic. */
+    fun recordBroadcastReceived() {
+        try {
+            val database = writableDatabase
+            database.beginTransaction()
+            try {
+                val cv = ContentValues().apply {
+                    put("key", "last_broadcast_at")
+                    put("value", nowIso())
+                }
+                database.insertWithOnConflict("diagnostics", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+
+                val cursor = database.rawQuery(
+                    "SELECT value FROM diagnostics WHERE key = 'total_broadcasts'", null
+                )
+                val current = if (cursor.moveToFirst()) cursor.getString(0).toIntOrNull() ?: 0 else 0
+                cursor.close()
+                val countCv = ContentValues().apply {
+                    put("key", "total_broadcasts")
+                    put("value", (current + 1).toString())
+                }
+                database.insertWithOnConflict("diagnostics", null, countCv, SQLiteDatabase.CONFLICT_REPLACE)
+
+                database.setTransactionSuccessful()
+            } finally {
+                database.endTransaction()
+            }
+        } catch (e: Exception) {
+            Log.e("ExpenseDbHelper", "Failed to record broadcast heartbeat", e)
+        }
+    }
+
     /**
-     * Inserts a new SMS-derived entry and enforces the 200-entry cap, all
-     * inside one transaction. The UNIQUE(dedupe_key) constraint combined
-     * with CONFLICT_IGNORE is what makes this safe against the classic
-     * Android quirk where SMS_RECEIVED can occasionally be redelivered, or
-     * where a dual-SIM/OEM ROM fires the broadcast twice: the second
-     * attempt for the same logical message is dropped atomically by SQLite
-     * itself, so there's no window for a race condition regardless of
-     * thread timing.
+     * Inserts a new SMS-derived entry and enforces the 200-entry cap.
+     * If the write itself fails for any reason, that failure is now
+     * surfaced into Unparsed Messages -- previously it only went to
+     * Logcat, which meant a correctly-parsed transaction could fail to
+     * save and vanish without any trace visible on the phone itself.
      */
     fun insertSmsEntry(
         amount: Double,
@@ -202,6 +230,9 @@ class ExpenseDbHelper private constructor(context: Context) :
         dedupeKey: String
     ) {
         val db = writableDatabase
+        var succeeded = false
+        var errorMessage: String? = null
+
         db.beginTransaction()
         try {
             val cv = ContentValues().apply {
@@ -215,19 +246,27 @@ class ExpenseDbHelper private constructor(context: Context) :
                 put("dedupe_key", dedupeKey)
             }
 
-            val rowId = db.insertWithOnConflict(
-                "entries", null, cv, SQLiteDatabase.CONFLICT_IGNORE
-            )
-
+            val rowId = db.insertWithOnConflict("entries", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
             if (rowId != -1L) {
                 enforceCapLocked(db)
             }
-
             db.setTransactionSuccessful()
+            succeeded = true
         } catch (e: Exception) {
             Log.e("ExpenseDbHelper", "Failed to insert SMS entry", e)
+            errorMessage = e.message
         } finally {
             db.endTransaction()
+        }
+
+        if (!succeeded) {
+            runCatching {
+                logFailedParse(
+                    smsDateTimeIso = entryDateIso,
+                    title = "Database error while saving a transaction from $receiver",
+                    body = "$rawBody\n\n(Internal error: ${errorMessage ?: "unknown"})"
+                )
+            }
         }
     }
 
@@ -241,7 +280,6 @@ class ExpenseDbHelper private constructor(context: Context) :
         }
         db.insert("failed_parses", null, cv)
 
-        // Bounded log so a flood of promo/OTP SMS can't grow this forever.
         db.execSQL(
             """
             DELETE FROM failed_parses WHERE id NOT IN (
@@ -251,13 +289,6 @@ class ExpenseDbHelper private constructor(context: Context) :
         )
     }
 
-    /**
-     * Must run inside an active transaction on [db].
-     * Trims non-anchor entries down to MAX_ENTRIES, folding the amount of
-     * every pruned row into the "Previous Expense" anchor entry so the
-     * all-time running total is mathematically unaffected by pruning —
-     * only per-entry metadata (receiver name, exact SMS body, etc.) is lost.
-     */
     private fun enforceCapLocked(db: SQLiteDatabase) {
         val countCursor = db.rawQuery(
             "SELECT COUNT(*) FROM entries WHERE is_previous_expense = 0", null
@@ -297,6 +328,21 @@ class ExpenseDbHelper private constructor(context: Context) :
                 "UPDATE entries SET amount = amount + ? WHERE is_previous_expense = 1",
                 arrayOf(foldedAmount)
             )
+            val changesCursor = db.rawQuery("SELECT changes()", null)
+            changesCursor.moveToFirst()
+            val rowsChanged = changesCursor.getInt(0)
+            changesCursor.close()
+            if (rowsChanged == 0) {
+                val cv = ContentValues().apply {
+                    put("amount", foldedAmount)
+                    put("receiver", "Previous Expense")
+                    put("entry_date", nowIso())
+                    put("source", "system")
+                    put("created_at", nowIso())
+                    put("is_previous_expense", 1)
+                }
+                db.insert("entries", null, cv)
+            }
         }
     }
 }

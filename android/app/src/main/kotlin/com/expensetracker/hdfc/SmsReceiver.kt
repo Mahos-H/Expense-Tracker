@@ -14,48 +14,60 @@ import java.util.TimeZone
 /**
  * Fires only when a new SMS arrives (manifest-registered receiver on the
  * protected SMS_RECEIVED broadcast). There is no service, no polling loop,
- * and nothing running between messages — this process wakes up, does a few
- * milliseconds of parsing + a SQLite write, and goes back to sleep.
+ * and nothing running between messages.
  *
- * The sender filter and message pattern are no longer hardcoded — they're
- * read from the `parser_settings` row on every broadcast, so changes made
- * in the app's Parser Settings screen take effect on the very next SMS
- * without needing a rebuild.
+ * The sender filter and message pattern are read from `parser_settings` on
+ * every broadcast (editable via the app's Parser Settings screen).
  */
 class SmsReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
 
+        val db = ExpenseDbHelper.getInstance(context)
+        // Recorded unconditionally, before any filtering: this is the fact
+        // that lets you check, after the fact, whether the OS delivered
+        // this broadcast to the app at all around the time an SMS arrived.
+        db.recordBroadcastReceived()
+
         try {
             val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
             if (messages.isNullOrEmpty()) return
 
-            val db = ExpenseDbHelper.getInstance(context)
             val settings = db.getParserSettings()
             val senderMarker = settings.senderMarker.trim().ifEmpty {
                 ExpenseDbHelper.DEFAULT_SENDER_MARKER
             }
 
-            // A single logical SMS can arrive as multiple PDU parts (long
-            // messages). Group by sender+timestamp and concatenate bodies
-            // so we parse ONE reconstructed message, not fragments.
+            // Group strictly by sender -- NOT by timestamp. SMS PDU
+            // timestamps only carry whole-second precision (a limit of the
+            // SMS protocol itself, not an Android quirk), so several
+            // genuinely distinct transactions delivered in a burst -- e.g.
+            // after the phone was offline or the app hadn't been opened in
+            // a while -- can share an identical timestamp down to the
+            // millisecond. Splitting groups on timestamp equality used to
+            // cause unrelated messages to get concatenated together and
+            // parsed as one, which silently kept only the first transaction
+            // with no failure logged anywhere.
             val groups = LinkedHashMap<String, MutableList<SmsMessage>>()
             for (msg in messages) {
-                val key = "${msg.originatingAddress}|${msg.timestampMillis}"
+                val key = msg.originatingAddress ?: continue
                 groups.getOrPut(key) { mutableListOf() }.add(msg)
             }
 
-            for ((_, parts) in groups) {
-                val sender = parts.first().originatingAddress ?: continue
+            for ((sender, parts) in groups) {
                 if (!sender.uppercase(Locale.ROOT).contains(senderMarker.uppercase(Locale.ROOT))) continue
 
-                val fullBody = parts.joinToString(separator = "") { it.messageBody ?: "" }
+                // A newline between parts is harmless for a genuine
+                // multi-part message (the pattern's \s+ absorbs it same as
+                // a space) and gives a little extra insurance against a
+                // spurious match spanning the boundary between two
+                // genuinely separate bundled messages.
+                val fullBody = parts.joinToString(separator = "\n") { it.messageBody ?: "" }
                 val smsTimestampMillis = parts.first().timestampMillis
                 handleMessage(db, settings, sender, fullBody, smsTimestampMillis)
             }
         } catch (e: Exception) {
-            // Never let a malformed SMS crash the receiver.
             runCatching {
                 ExpenseDbHelper.getInstance(context).logFailedParse(
                     smsDateTimeIso = ExpenseDbHelper.nowIso(),
@@ -91,9 +103,21 @@ class SmsReceiver : BroadcastReceiver() {
             usedFallback = true
         }
 
-        val match = pattern?.find(body)
+        if (pattern == null) {
+            db.logFailedParse(isoDateTime, "Parser pattern completely broken from $sender", body)
+            return
+        }
 
-        if (match == null || match.groupValues.size < 3) {
+        // findAll, not find: this is what actually fixes the "burst of
+        // transactions arriving together" problem. If the reconstructed
+        // body contains more than one "Sent ... To ... On ..." block --
+        // whether that's a real multi-part SMS or several distinct
+        // messages that got bundled into the same broadcast -- every one
+        // of them gets matched and turned into its own entry, instead of
+        // only the first being kept and the rest silently disappearing.
+        val matches = pattern.findAll(body).toList()
+
+        if (matches.isEmpty()) {
             db.logFailedParse(
                 smsDateTimeIso = isoDateTime,
                 title = if (usedFallback)
@@ -105,32 +129,42 @@ class SmsReceiver : BroadcastReceiver() {
             return
         }
 
-        val amountStr = match.groupValues[1].replace(",", "")
-        val amount = amountStr.toDoubleOrNull()
-        var receiver = match.groupValues[2].trim()
+        var anyInserted = false
+        for (match in matches) {
+            if (match.groupValues.size < 3) continue
 
-        if (amount == null || receiver.isEmpty()) {
-            db.logFailedParse(
-                smsDateTimeIso = isoDateTime,
-                title = "Malformed SMS from $sender (matched pattern but bad amount/receiver)",
-                body = body
+            val amountStr = match.groupValues[1].replace(",", "")
+            val amount = amountStr.toDoubleOrNull()
+            var receiver = match.groupValues[2].trim()
+
+            if (amount == null || receiver.isEmpty()) {
+                db.logFailedParse(
+                    smsDateTimeIso = isoDateTime,
+                    title = "Malformed SMS from $sender (matched pattern but bad amount/receiver)",
+                    body = match.value
+                )
+                continue
+            }
+
+            receiver = db.applyRenameRule(receiver)
+            // Match position is folded into the dedupe key too, so that if
+            // two distinct transactions in the same burst happen to have
+            // identical amount + receiver (plausible -- same shop, same
+            // price, twice in a row), they don't get mistaken for the same
+            // transaction and one silently dropped.
+            val dedupeKey = buildDedupeKey(sender, timestampMillis, amountStr, receiver, match.range.first)
+
+            db.insertSmsEntry(
+                amount = amount,
+                receiver = receiver,
+                entryDateIso = isoDateTime,
+                rawBody = match.value,
+                dedupeKey = dedupeKey
             )
-            return
+            anyInserted = true
         }
 
-        receiver = db.applyRenameRule(receiver)
-        val dedupeKey = buildDedupeKey(sender, timestampMillis, amountStr, receiver)
-
-        // Debit = positive, per the tracker's sign convention.
-        db.insertSmsEntry(
-            amount = amount,
-            receiver = receiver,
-            entryDateIso = isoDateTime,
-            rawBody = body,
-            dedupeKey = dedupeKey
-        )
-
-        if (usedFallback) {
+        if (usedFallback && anyInserted) {
             db.logFailedParse(
                 smsDateTimeIso = isoDateTime,
                 title = "Note: your custom parser pattern was invalid — this message was " +
@@ -140,8 +174,14 @@ class SmsReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun buildDedupeKey(sender: String, timestampMillis: Long, amount: String, receiver: String): String {
-        val raw = "$sender|$timestampMillis|$amount|$receiver"
+    private fun buildDedupeKey(
+        sender: String,
+        timestampMillis: Long,
+        amount: String,
+        receiver: String,
+        matchPosition: Int
+    ): String {
+        val raw = "$sender|$timestampMillis|$amount|$receiver|$matchPosition"
         val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
         return digest.joinToString("") { "%02x".format(it) }
     }
