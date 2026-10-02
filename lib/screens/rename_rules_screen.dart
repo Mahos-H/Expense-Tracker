@@ -38,29 +38,34 @@ class _RenameRulesScreenState extends State<RenameRulesScreen> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) => AlertDialog(
           title: const Text('New rename rule'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: fromController,
-                decoration: const InputDecoration(
-                  labelText: 'Exact SMS receiver name',
-                  hintText: 'e.g. BOTTLE LAB TECHNOLOGIES P',
+          // Wrapped in SingleChildScrollView so that when the keyboard pops
+          // up and shrinks the available height, this content scrolls
+          // instead of overflowing past the bottom of the dialog.
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: fromController,
+                  decoration: const InputDecoration(
+                    labelText: 'Exact SMS receiver name',
+                    hintText: 'e.g. BOTTLE LAB TECHNOLOGIES P',
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: toController,
-                decoration: const InputDecoration(labelText: 'Rename to', hintText: 'e.g. Lunch'),
-              ),
-              const SizedBox(height: 8),
-              CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                value: applyToExisting,
-                title: const Text('Apply to existing matching entries'),
-                onChanged: (v) => setLocal(() => applyToExisting = v ?? true),
-              ),
-            ],
+                const SizedBox(height: 12),
+                TextField(
+                  controller: toController,
+                  decoration: const InputDecoration(labelText: 'Rename to', hintText: 'e.g. Lunch'),
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: applyToExisting,
+                  title: const Text('Apply to existing matching entries'),
+                  onChanged: (v) => setLocal(() => applyToExisting = v ?? true),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),

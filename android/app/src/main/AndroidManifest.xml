@@ -1,10 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Only permission this app ever requests. No INTERNET permission is
-         declared anywhere in this manifest — the app is offline by design,
-         not just by policy, so it is physically incapable of phoning home. -->
+    <!-- RECEIVE_SMS: the original, permanent permission — lets the app
+         react to new SMS as they arrive. Always present, every flavor. -->
     <uses-permission android:name="android.permission.RECEIVE_SMS"/>
+
+    <!-- Only used on Android 9 and below as a fallback path for writing the
+         daily backup file to the public Downloads folder — Android 10+
+         uses MediaStore instead, which needs no extra permission. Capped
+         with maxSdkVersion so it's simply unused/irrelevant on modern
+         devices rather than an extra permission prompt. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+
+    <!-- READ_SMS is intentionally NOT declared here. It only gets added for
+         the "recovery" build flavor, via src/recovery/AndroidManifest.xml —
+         normal day-to-day builds (the "standard" flavor) never request it
+         at all. -->
 
     <application
         android:label="Expense Tracker"
@@ -34,18 +46,6 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
-        <!--
-          Manifest-declared receiver for the protected SMS_RECEIVED broadcast.
-          This is what lets the app react to new SMS WITHOUT any foreground
-          service, WorkManager polling, or the app being open — Android
-          exempts manifest receivers listening to protected system broadcasts
-          from the background-execution limits introduced in Android 8+.
-
-          android:permission="BROADCAST_SMS" is a security guardrail: only
-          the system (which holds BROADCAST_SMS) is allowed to trigger this
-          receiver, so a malicious third-party app cannot forge a fake SMS
-          broadcast to inject fabricated expense entries.
-        -->
         <receiver
             android:name=".SmsReceiver"
             android:exported="true"

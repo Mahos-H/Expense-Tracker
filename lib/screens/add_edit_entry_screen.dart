@@ -20,10 +20,6 @@ class _AddEditEntryScreenState extends State<AddEditEntryScreen> {
 
   bool get _isEditing => widget.existing != null;
   bool get _isAnchor => widget.existing?.isPreviousExpense ?? false;
-  // The SMS timestamp is ground truth for when the transaction happened —
-  // everything else about an SMS-derived entry stays editable, but the
-  // date/time itself is locked so it can never drift from what the bank
-  // actually sent.
   bool get _isDateLocked => widget.existing?.source == 'sms';
 
   @override
@@ -47,11 +43,21 @@ class _AddEditEntryScreenState extends State<AddEditEntryScreen> {
 
   Future<void> _pickDateTime() async {
     if (_isDateLocked) return;
+    final now = DateTime.now();
+    final firstDate = DateTime(2015);
+    // Future dates are allowed up to 5 years ahead. Computed fresh every
+    // time the picker opens, so the window keeps sliding forward with the
+    // calendar instead of being frozen to whenever the app was built.
+    final lastDate = DateTime(now.year + 5, now.month, now.day);
+    var initial = _selectedDateTime;
+    if (initial.isBefore(firstDate)) initial = firstDate;
+    if (initial.isAfter(lastDate)) initial = lastDate;
+
     final date = await showDatePicker(
       context: context,
-      initialDate: _selectedDateTime,
-      firstDate: DateTime(2015),
-      lastDate: DateTime.now().add(const Duration(days: 1)),
+      initialDate: initial,
+      firstDate: firstDate,
+      lastDate: lastDate,
     );
     if (date == null || !mounted) return;
     final time = await showTimePicker(
@@ -92,8 +98,7 @@ class _AddEditEntryScreenState extends State<AddEditEntryScreen> {
     if (_isEditing) {
       final confirmed = await _confirm(
         'Save changes?',
-        'Are you sure you want to edit this entry? This updates the amount, '
-        'name, and date shown above.',
+        'Are you sure you want to edit this entry?',
       );
       if (!confirmed) return;
     }
@@ -108,8 +113,6 @@ class _AddEditEntryScreenState extends State<AddEditEntryScreen> {
         id: widget.existing!.id,
         amount: signedAmount,
         receiver: receiver,
-        // Locked entries keep their original SMS timestamp no matter what
-        // was in the (disabled) date field.
         entryDate: _isDateLocked ? widget.existing!.entryDate : _selectedDateTime,
         source: widget.existing!.source,
         rawSmsBody: widget.existing!.rawSmsBody,
@@ -157,10 +160,8 @@ class _AddEditEntryScreenState extends State<AddEditEntryScreen> {
                 const Padding(
                   padding: EdgeInsets.only(bottom: 12),
                   child: Text(
-                    'This is the anchor entry representing your balance before tracking '
-                    'started (plus anything folded in from pruned old entries). Every '
-                    "field here is editable, but this entry can't be deleted — the app "
-                    'relies on it always existing to keep your all-time total correct.',
+                    "This entry can't be deleted — it keeps your all-time total correct "
+                    'when old entries get pruned.',
                     style: TextStyle(color: Colors.grey),
                   ),
                 ),
@@ -205,20 +206,10 @@ class _AddEditEntryScreenState extends State<AddEditEntryScreen> {
                 const Padding(
                   padding: EdgeInsets.only(top: 4),
                   child: Text(
-                    "Date & time comes directly from the SMS and can't be changed — "
-                    'everything else on this entry can.',
+                    "Date & time comes from the SMS and can't be changed.",
                     style: TextStyle(color: Colors.grey, fontSize: 12),
                   ),
                 ),
-              if (_isEditing && widget.existing?.source == 'sms') ...[
-                const SizedBox(height: 8),
-                const Text(
-                  'Originally created automatically from an SMS. Editing the amount or '
-                  'name here only changes what you see in the app — it does not affect '
-                  'the SMS itself.',
-                  style: TextStyle(color: Colors.grey, fontSize: 12),
-                ),
-              ],
               const SizedBox(height: 24),
               FilledButton(onPressed: _save, child: const Text('Save')),
               if (_isEditing && !_isAnchor) ...[

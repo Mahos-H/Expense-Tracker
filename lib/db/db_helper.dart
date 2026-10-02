@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
@@ -7,13 +8,18 @@ import '../models/failed_parse.dart';
 import '../models/parser_settings.dart';
 import '../models/rename_rule.dart';
 
+/// Opens the database file whose name is derived from the app's own
+/// installed version (e.g. "expense_tracker_1.0.3.db"), not a fixed name.
+/// The actual filename is asked of the native side (which reads the real
+/// installed versionName) rather than duplicated here, so Dart and Kotlin
+/// can never disagree about which file to open.
 class DbHelper {
   DbHelper._internal();
   static final DbHelper instance = DbHelper._internal();
 
-  static const String dbName = 'expense_tracker.db';
+  static const _channel = MethodChannel('com.expensetracker.hdfc/permissions');
   static const int dbVersion = 3;
-  static const int maxEntries = 200;
+  static const int maxEntries = 300;
 
   Database? _db;
 
@@ -23,9 +29,22 @@ class DbHelper {
     return _db!;
   }
 
+  Future<String> _resolveDbFileName() async {
+    try {
+      final name = await _channel.invokeMethod<String>('getDbFileName');
+      if (name != null && name.isNotEmpty) return name;
+    } catch (_) {
+      // falls through to the fallback below
+    }
+    // Should rarely trigger -- only if the platform channel itself is
+    // unavailable, which would mean something is badly wrong elsewhere too.
+    return 'expense_tracker_unknown.db';
+  }
+
   Future<Database> _open() async {
     final dbPath = await getDatabasesPath();
-    final path = p.join(dbPath, dbName);
+    final fileName = await _resolveDbFileName();
+    final path = p.join(dbPath, fileName);
     return openDatabase(
       path,
       version: dbVersion,
@@ -131,6 +150,18 @@ class DbHelper {
       },
       conflictAlgorithm: ConflictAlgorithm.ignore,
     );
+
+    // One-time upgrade: if the sender filter is still exactly the OLD
+    // built-in default ("HDFCBK"), move it to the new default ("HDFC"). A
+    // value you customized yourself in Parser Settings is left untouched.
+    final rows = await database.query('parser_settings', where: 'id = 1', limit: 1);
+    if (rows.isNotEmpty && rows.first['sender_marker'] == 'HDFCBK') {
+      await database.update(
+        'parser_settings',
+        {'sender_marker': ParserSettings.defaultSenderMarker},
+        where: 'id = 1',
+      );
+    }
   }
 
   // ---------------- Entries ----------------
@@ -295,33 +326,20 @@ class DbHelper {
     );
   }
 
-  Future<void> resetParserSettings() async {
-    await updateParserSettings(
-      ParserSettings.defaultSenderMarker,
-      ParserSettings.defaultMessageRegex,
-    );
-  }
-
   // ---------------- Diagnostics ----------------
 
-  /// Read-only from the Dart side -- only the native receiver writes to
-  /// this table. Lets you check whether the receiver has run recently at
-  /// all, independent of whether parsing succeeded.
   Future<DiagnosticsInfo> getDiagnostics() async {
     final database = await db;
-    final rows = await database.query('diagnostics');
-    DateTime? lastBroadcastAt;
-    int totalBroadcasts = 0;
-    for (final row in rows) {
-      final key = row['key'] as String;
-      final value = row['value'] as String;
-      if (key == 'last_broadcast_at') {
-        lastBroadcastAt = DateTime.tryParse(value);
-      } else if (key == 'total_broadcasts') {
-        totalBroadcasts = int.tryParse(value) ?? 0;
-      }
+    final rows = await database.query(
+      'diagnostics',
+      where: 'key = ?',
+      whereArgs: ['last_broadcast_at'],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return DiagnosticsInfo(lastBroadcastAt: null);
     }
-    return DiagnosticsInfo(lastBroadcastAt: lastBroadcastAt, totalBroadcasts: totalBroadcasts);
+    return DiagnosticsInfo(lastBroadcastAt: DateTime.tryParse(rows.first['value'] as String));
   }
 
   String _iso(DateTime d) => d.toIso8601String().split('.').first;
