@@ -8,9 +8,18 @@ import '../theme/app_theme.dart';
 import '../utils/date_range.dart';
 import 'add_edit_entry_screen.dart';
 import 'failed_parses_screen.dart';
+import 'import_sms_screen.dart';
 import 'parser_settings_screen.dart';
 import 'rename_rules_screen.dart';
 import 'trend_screen.dart';
+
+// Build with `--dart-define=ENABLE_SMS_IMPORTER=true` to show the "Import
+// from SMS" icon. Off by default -- normal day-to-day builds never expose
+// it. Note this only controls whether the icon/screen is reachable; the
+// READ_SMS permission itself is excluded from the APK entirely only when
+// building the "standard" Gradle flavor (see build.gradle.kts notes).
+const bool kEnableSmsImporter =
+    bool.fromEnvironment('ENABLE_SMS_IMPORTER', defaultValue: false);
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -21,14 +30,17 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _channel = MethodChannel('com.expensetracker.hdfc/permissions');
 
-  RangePreset _preset = RangePreset.month; // default: monthly, per device clock
+  RangePreset _preset = RangePreset.month;
   DateTime? _customStart;
   DateTime? _customEnd;
 
   bool? _hasSmsPermission;
   List<ExpenseEntry> _entries = [];
-  double _total = 0.0;
   bool _loading = true;
+
+  bool _isSearching = false;
+  final _searchController = TextEditingController();
+  String _searchQuery = '';
 
   @override
   void initState() {
@@ -36,21 +48,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _checkPermission();
     _refresh();
+    _runBackupCheck();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // The receiver may have written new entries while the app was
-    // backgrounded/closed — reload whenever the app comes back to front.
     if (state == AppLifecycleState.resumed) {
       _checkPermission();
       _refresh();
+      _runBackupCheck();
     }
   }
 
@@ -63,12 +76,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// If the in-app request comes back denied and this isn't the first time
+  /// asking, Android has permanently blocked its own dialog from showing
+  /// again -- the native side detects that and opens system Settings
+  /// instead, where the permission can still be flipped manually. Either
+  /// way, re-check afterward so the banner reflects the real state.
   Future<void> _requestPermission() async {
     try {
       final granted = await _channel.invokeMethod<bool>('requestSmsPermission') ?? false;
       if (mounted) setState(() => _hasSmsPermission = granted);
+      if (!granted) {
+        // Re-check shortly after, in case Settings was opened and the
+        // person flips it there instead of through a dialog.
+        await Future.delayed(const Duration(milliseconds: 500));
+        await _checkPermission();
+      }
     } on PlatformException {
       // ignore
+    }
+  }
+
+  Future<void> _runBackupCheck() async {
+    try {
+      await _channel.invokeMethod('runDailyBackupCheck');
+    } on PlatformException {
+      // ignore -- non-critical, will just retry next time the app opens
     }
   }
 
@@ -83,24 +115,78 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _loading = true);
     final range = _currentRange;
     final entries = await DbHelper.instance.getEntries(start: range.start, end: range.end);
-    final total = entries.fold<double>(0.0, (s, e) => s + e.amount);
     if (!mounted) return;
     setState(() {
       _entries = entries;
-      _total = total;
       _loading = false;
     });
   }
+
+  // ---------------- Search ----------------
+
+  void _toggleSearch() {
+    setState(() {
+      if (_isSearching) {
+        _isSearching = false;
+        _searchController.clear();
+        _searchQuery = '';
+      } else {
+        _isSearching = true;
+      }
+    });
+  }
+
+  bool _matchesFrontPortion(String receiver, String query) {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return true;
+    for (final word in _wordsOf(receiver)) {
+      if (word.toLowerCase().startsWith(q)) return true;
+    }
+    return false;
+  }
+
+  List<String> _wordsOf(String text) {
+    final words = <String>[];
+    for (final chunk in text.split(RegExp(r'\s+'))) {
+      if (chunk.isEmpty) continue;
+      words.add(chunk);
+      words.addAll(_splitCamelCase(chunk));
+    }
+    return words;
+  }
+
+  List<String> _splitCamelCase(String chunk) {
+    bool isLower(String c) => c.codeUnitAt(0) >= 97 && c.codeUnitAt(0) <= 122;
+    bool isUpper(String c) => c.codeUnitAt(0) >= 65 && c.codeUnitAt(0) <= 90;
+
+    final parts = <String>[];
+    var start = 0;
+    for (var i = 1; i < chunk.length; i++) {
+      if (isLower(chunk[i - 1]) && isUpper(chunk[i])) {
+        parts.add(chunk.substring(start, i));
+        start = i;
+      }
+    }
+    if (start > 0) parts.add(chunk.substring(start));
+    return parts;
+  }
+
+  List<ExpenseEntry> get _visibleEntries {
+    if (_searchQuery.trim().isEmpty) return _entries;
+    return _entries.where((e) => _matchesFrontPortion(e.receiver, _searchQuery)).toList();
+  }
+
+  // ---------------- Date range ----------------
 
   Future<void> _pickCustomRange() async {
     final now = DateTime.now();
     final result = await showDateRangePicker(
       context: context,
       firstDate: DateTime(now.year - 5),
-      lastDate: DateTime(now.year + 1),
+      lastDate: DateTime(now.year + 5, now.month, now.day),
       initialDateRange: DateTimeRange(
         start: _customStart ?? now.subtract(const Duration(days: 7)),
-        end: _customEnd ?? now,
+        end: _customEnd != null ? _customEnd!.subtract(const Duration(days: 1)) : now,
       ),
     );
     if (result != null) {
@@ -137,34 +223,62 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final currency = NumberFormat.currency(locale: 'en_IN', symbol: '\u20B9', decimalDigits: 2);
+    final visible = _visibleEntries;
+    final total = visible.fold<double>(0.0, (s, e) => s + e.amount);
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Expense Tracker'),
+        title: _isSearching
+            ? TextField(
+                controller: _searchController,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  hintText: 'Search receiver name...',
+                  border: InputBorder.none,
+                ),
+                style: const TextStyle(fontSize: 16),
+                onChanged: (v) => setState(() => _searchQuery = v),
+              )
+            : const Text('Expense Tracker'),
         actions: [
           IconButton(
-            icon: const Icon(Icons.show_chart),
-            tooltip: 'Trend',
-            onPressed: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const TrendScreen())),
+            icon: Icon(_isSearching ? Icons.close : Icons.search),
+            tooltip: _isSearching ? 'Close search' : 'Search',
+            onPressed: _toggleSearch,
           ),
-          IconButton(
-            icon: const Icon(Icons.rule),
-            tooltip: 'Parser settings',
-            onPressed: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const ParserSettingsScreen())),
-          ),
-          IconButton(
-            icon: const Icon(Icons.swap_horiz),
-            tooltip: 'Rename rules',
-            onPressed: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const RenameRulesScreen())),
-          ),
-          IconButton(
-            icon: const Icon(Icons.report_gmailerrorred_outlined),
-            tooltip: 'Unparsed messages',
-            onPressed: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const FailedParsesScreen())),
-          ),
+          if (!_isSearching) ...[
+            if (kEnableSmsImporter)
+              IconButton(
+                icon: const Icon(Icons.sms_outlined),
+                tooltip: 'Import from SMS',
+                onPressed: () => Navigator.of(context)
+                    .push(MaterialPageRoute(builder: (_) => const ImportSmsScreen())),
+              ),
+            IconButton(
+              icon: const Icon(Icons.show_chart),
+              tooltip: 'Trend',
+              onPressed: () => Navigator.of(context)
+                  .push(MaterialPageRoute(builder: (_) => const TrendScreen())),
+            ),
+            IconButton(
+              icon: const Icon(Icons.rule),
+              tooltip: 'Parser settings',
+              onPressed: () => Navigator.of(context)
+                  .push(MaterialPageRoute(builder: (_) => const ParserSettingsScreen())),
+            ),
+            IconButton(
+              icon: const Icon(Icons.swap_horiz),
+              tooltip: 'Rename rules',
+              onPressed: () => Navigator.of(context)
+                  .push(MaterialPageRoute(builder: (_) => const RenameRulesScreen())),
+            ),
+            IconButton(
+              icon: const Icon(Icons.report_gmailerrorred_outlined),
+              tooltip: 'Unparsed messages',
+              onPressed: () => Navigator.of(context)
+                  .push(MaterialPageRoute(builder: (_) => const FailedParsesScreen())),
+            ),
+          ],
         ],
       ),
       floatingActionButton: FloatingActionButton(
@@ -174,19 +288,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       body: Column(
         children: [
           if (_hasSmsPermission == false) _permissionBanner(),
-          _rangeSelector(),
-          _totalCard(currency),
+          if (!_isSearching) _rangeSelector(),
+          _totalCard(currency, total),
           const Divider(height: 1),
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
-                : _entries.isEmpty
-                    ? const Center(child: Text('No entries in this range'))
+                : visible.isEmpty
+                    ? Center(
+                        child: Text(
+                          _searchQuery.trim().isEmpty
+                              ? 'No entries in this range'
+                              : 'No matches for "$_searchQuery"',
+                        ),
+                      )
                     : RefreshIndicator(
                         onRefresh: _refresh,
                         child: ListView.builder(
-                          itemCount: _entries.length,
-                          itemBuilder: (context, i) => _entryTile(_entries[i], currency),
+                          itemCount: visible.length,
+                          itemBuilder: (context, i) => _entryTile(visible[i], currency),
                         ),
                       ),
           ),
@@ -257,17 +377,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _totalCard(NumberFormat currency) {
-    final isNegative = _total < 0;
+  Widget _totalCard(NumberFormat currency, double total) {
+    final isNegative = total < 0;
+    final label = _searchQuery.trim().isEmpty ? 'Total (this range)' : 'Total (matching search)';
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('Total (this range)', style: TextStyle(fontSize: 14, color: Colors.grey)),
+            Text(label, style: const TextStyle(fontSize: 14, color: Colors.grey)),
             Text(
-              currency.format(_total),
+              currency.format(total),
               style: TextStyle(
                 fontSize: 22,
                 fontWeight: FontWeight.bold,
@@ -290,15 +411,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             : 'Anchor';
 
     final tile = Card(
-      child: ListTile(
+      child: InkWell(
         onTap: () => _openEditEntry(entry),
-        title: Text(entry.receiver, style: const TextStyle(fontWeight: FontWeight.w600)),
-        subtitle: Text('$dateStr  \u2022  $sourceLabel'),
-        trailing: Text(
-          currency.format(entry.amount),
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            color: isNegative ? AppTheme.negativeColor : AppTheme.positiveColor,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      entry.receiver,
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '$dateStr  \u2022  $sourceLabel',
+                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                currency.format(entry.amount),
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: isNegative ? AppTheme.negativeColor : AppTheme.positiveColor,
+                ),
+              ),
+            ],
           ),
         ),
       ),

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Merged in only for the "recovery" build flavor. Lets the "Import
+         from SMS" screen scan the existing inbox for old HDFC messages. -->
+    <uses-permission android:name="android.permission.READ_SMS"/>
+
+</manifest>

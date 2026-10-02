@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../db/db_helper.dart';
 import '../models/diagnostics_info.dart';
-import '../models/parser_settings.dart';
 
 class ParserSettingsScreen extends StatefulWidget {
   const ParserSettingsScreen({super.key});
@@ -12,6 +12,8 @@ class ParserSettingsScreen extends StatefulWidget {
 }
 
 class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
+  static const _channel = MethodChannel('com.expensetracker.hdfc/permissions');
+
   final _formKey = GlobalKey<FormState>();
   final _senderController = TextEditingController();
   final _regexController = TextEditingController();
@@ -21,6 +23,7 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
   String? _testReceiver;
   String? _testError;
   bool _loading = true;
+  bool _exporting = false;
   DiagnosticsInfo? _diagnostics;
 
   @override
@@ -50,6 +53,43 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
     super.dispose();
   }
 
+  Future<void> _exportNow() async {
+    setState(() => _exporting = true);
+    try {
+      final fileName = await _channel.invokeMethod<String>('exportDatabaseNow');
+      if (!mounted) return;
+      setState(() => _exporting = false);
+      if (fileName != null) {
+        showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Exported'),
+            content: Text(
+              'Saved to your Downloads folder as:\n\n$fileName\n\n'
+              'This is a plain file now, outside the app\'s private storage — '
+              'copy it to your laptop however\'s convenient (USB file transfer, '
+              'adb pull, cloud sync) and it\'ll open directly in DB Browser for '
+              'SQLite or any sqlite3 tool.',
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+            ],
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Export failed — check device storage/logs.')),
+        );
+      }
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() => _exporting = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Export failed: ${e.message ?? e.code}')),
+      );
+    }
+  }
+
   void _runTest() {
     setState(() {
       _testAmount = null;
@@ -65,8 +105,7 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
       }
       if (match.groupCount < 2) {
         setState(() => _testError =
-            'Pattern matched, but it needs at least 2 capture groups (amount, receiver). '
-            'Found ${match.groupCount}.');
+            'Needs at least 2 capture groups (amount, receiver). Found ${match.groupCount}.');
         return;
       }
       setState(() {
@@ -94,12 +133,8 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Update parser settings?'),
-        content: const Text(
-          'This changes which SMS get auto-tracked from now on. Existing entries are '
-          'not affected. If this pattern ever fails to compile on the phone, the app '
-          "falls back to the built-in HDFC default so tracking doesn't silently stop.",
-        ),
+        title: const Text('Save parser settings?'),
+        content: const Text('This changes which SMS get auto-tracked from now on.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
@@ -118,54 +153,51 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
     }
   }
 
-  Future<void> _resetDefault() async {
-    setState(() {
-      _senderController.text = ParserSettings.defaultSenderMarker;
-      _regexController.text = ParserSettings.defaultMessageRegex;
-    });
-    await DbHelper.instance.resetParserSettings();
-    if (mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Reset to the built-in HDFC default.')));
-    }
-  }
-
   Widget _diagnosticsCard() {
-    final d = _diagnostics;
-    final lastBroadcast = d?.lastBroadcastAt;
-    final ageText = lastBroadcast == null
-        ? 'never (since this install, or since the app was last force-stopped)'
+    final lastBroadcast = _diagnostics?.lastBroadcastAt;
+    final text = lastBroadcast == null
+        ? 'never'
         : DateFormat('dd MMM yyyy, hh:mm:ss a').format(lastBroadcast);
 
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('Receiver diagnostics', style: TextStyle(fontWeight: FontWeight.w600)),
-                IconButton(
-                  icon: const Icon(Icons.refresh, size: 20),
-                  tooltip: 'Refresh',
-                  onPressed: _load,
-                ),
-              ],
+            Expanded(child: Text('Last SMS seen: $text')),
+            IconButton(
+              icon: const Icon(Icons.refresh, size: 20),
+              tooltip: 'Refresh',
+              onPressed: _load,
             ),
-            const SizedBox(height: 4),
-            Text('Last SMS broadcast received: $ageText'),
-            Text('Total broadcasts handled since install: ${d?.totalBroadcasts ?? 0}'),
-            const SizedBox(height: 8),
-            const Text(
-              "If a bank SMS lands in your inbox but this timestamp doesn't move at "
-              "roughly the same moment, the phone's OS never delivered it to this app — "
-              'check your battery optimization / autostart settings for this app, since '
-              "that's a phone-level restriction, not something this app can fix on its "
-              'own. If the timestamp DOES update but the transaction still never shows '
-              "up anywhere (including Unparsed Messages), that's worth reporting as a bug.",
-              style: TextStyle(color: Colors.grey, fontSize: 12),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _exportCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Save a copy of the whole database to Downloads right now.',
+              ),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(
+              onPressed: _exporting ? null : _exportNow,
+              child: _exporting
+                  ? const SizedBox(
+                      height: 16,
+                      width: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Export now'),
             ),
           ],
         ),
@@ -176,16 +208,7 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Parser Settings'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.restore),
-            tooltip: 'Reset to HDFC default',
-            onPressed: _resetDefault,
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Parser Settings')),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : Padding(
@@ -195,12 +218,11 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
                 child: ListView(
                   children: [
                     _diagnosticsCard(),
+                    const SizedBox(height: 8),
+                    _exportCard(),
                     const SizedBox(height: 16),
                     const Text(
-                      'Controls which incoming SMS get auto-tracked, and how they\'re '
-                      'parsed. The sender check is a simple "contains" match. The pattern '
-                      'must have capture group 1 = amount and capture group 2 = receiver '
-                      'name — anything else in the message is ignored.',
+                      'Capture group 1 must be the amount, group 2 the receiver name.',
                       style: TextStyle(color: Colors.grey),
                     ),
                     const SizedBox(height: 16),
@@ -208,7 +230,7 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
                       controller: _senderController,
                       decoration: const InputDecoration(
                         labelText: 'Sender must contain',
-                        hintText: 'e.g. HDFCBK',
+                        hintText: 'e.g. HDFC',
                       ),
                       validator: (v) => (v == null || v.trim().isEmpty) ? 'Required' : null,
                     ),
@@ -232,7 +254,7 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
                       minLines: 2,
                       maxLines: 4,
                       decoration: const InputDecoration(
-                        hintText: 'Paste a sample SMS body here to try the pattern above',
+                        hintText: 'Paste a sample SMS body here',
                       ),
                     ),
                     const SizedBox(height: 8),
@@ -250,14 +272,6 @@ class _ParserSettingsScreenState extends State<ParserSettingsScreen> {
                     ],
                     const SizedBox(height: 24),
                     FilledButton(onPressed: _save, child: const Text('Save parser settings')),
-                    const SizedBox(height: 8),
-                    const Text(
-                      "Note: this preview uses Dart's regex engine; the phone parses with "
-                      "Kotlin's engine. They agree on virtually all everyday patterns, but "
-                      'if you use advanced regex features, double check on a real message '
-                      'afterward via the Unparsed Messages screen.',
-                      style: TextStyle(color: Colors.grey, fontSize: 12),
-                    ),
                   ],
                 ),
               ),

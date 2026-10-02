@@ -1,6 +1,7 @@
-import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'dart:ui' as ui;
+
 import '../db/db_helper.dart';
 import '../models/entry.dart';
 import '../theme/app_theme.dart';
@@ -24,6 +25,7 @@ class _TrendScreenState extends State<TrendScreen> {
   DateTime? _customEnd;
   bool _loading = true;
   List<_ChartPoint> _points = [];
+  double _baseline = 0;
 
   @override
   void initState() {
@@ -38,14 +40,13 @@ class _TrendScreenState extends State<TrendScreen> {
     return DateRange.forPreset(_preset);
   }
 
-  /// Builds a cumulative running-total series:
-  ///  - `baseline` = sum of every entry dated before the range starts
-  ///    (this is what "start at previous expenses" means here — the graph
-  ///    begins at whatever the account had already accumulated, not at ₹0).
-  ///  - each entry inside the range then nudges the running total up/down.
-  ///  - the line is extended flat to the right edge of the range if nothing
-  ///    happened right up to the boundary, so short/quiet frames still show
-  ///    a visible line instead of a single dot.
+  /// Only real entries are ever plotted -- no synthetic point is added at
+  /// the start or end of the selected range. The Y-value at each point is
+  /// still correct (offset by `baseline`, the sum of everything before the
+  /// range starts), but the line's actual extent on screen is bounded by
+  /// wherever your real transactions are, never stretched out to fill the
+  /// whole window with invented flat data before the first entry or after
+  /// the last one.
   Future<void> _load() async {
     setState(() => _loading = true);
     final all = await DbHelper.instance.getAllEntriesAscending();
@@ -66,32 +67,15 @@ class _TrendScreenState extends State<TrendScreen> {
 
     final points = <_ChartPoint>[];
     double running = baseline;
-
-    if (range.start != null) {
-      points.add(_ChartPoint(range.start!, running));
-      for (final e in withinRange) {
-        running += e.amount;
-        points.add(_ChartPoint(e.entryDate, running));
-      }
-    } else if (withinRange.isNotEmpty) {
-      // "All" view has no left boundary — start right at the very first
-      // entry (which, chronologically, is usually the anchor itself).
-      for (final e in withinRange) {
-        running += e.amount;
-        points.add(_ChartPoint(e.entryDate, running));
-      }
-    }
-
-    if (range.end != null) {
-      final edge = range.end!.subtract(const Duration(seconds: 1));
-      if (points.isEmpty || edge.isAfter(points.last.time)) {
-        points.add(_ChartPoint(edge, running));
-      }
+    for (final e in withinRange) {
+      running += e.amount;
+      points.add(_ChartPoint(e.entryDate, running));
     }
 
     if (!mounted) return;
     setState(() {
       _points = points;
+      _baseline = baseline;
       _loading = false;
     });
   }
@@ -101,10 +85,12 @@ class _TrendScreenState extends State<TrendScreen> {
     final result = await showDateRangePicker(
       context: context,
       firstDate: DateTime(now.year - 5),
-      lastDate: DateTime(now.year + 1),
+      lastDate: DateTime(now.year + 5, now.month, now.day),
       initialDateRange: DateTimeRange(
         start: _customStart ?? now.subtract(const Duration(days: 7)),
-        end: _customEnd ?? now,
+        // _customEnd is stored exclusive (the day after the picked end), so
+        // step back a day to hand the picker the end date actually chosen.
+        end: _customEnd != null ? _customEnd!.subtract(const Duration(days: 1)) : now,
       ),
     );
     if (result != null) {
@@ -135,7 +121,7 @@ class _TrendScreenState extends State<TrendScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final total = _points.isEmpty ? 0.0 : _points.last.value;
+    final total = _points.isEmpty ? _baseline : _points.last.value;
     final currency = NumberFormat.currency(locale: 'en_IN', symbol: '\u20B9', decimalDigits: 0);
     final compact = NumberFormat.compactCurrency(locale: 'en_IN', symbol: '\u20B9');
 
@@ -185,8 +171,7 @@ class _TrendScreenState extends State<TrendScreen> {
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
             child: Text(
-              "The Y-axis is zoomed to this range's actual values, not from \u20B90 — "
-              'read the axis labels, not just the shape, when comparing across time frames.',
+              "The Y-axis is zoomed to this range's actual values, not from \u20B90.",
               style: TextStyle(color: Colors.grey, fontSize: 12),
               textAlign: TextAlign.center,
             ),
@@ -269,9 +254,6 @@ class _LineChartPainter extends CustomPainter {
     double minY = points.map((pt) => pt.value).reduce((a, b) => a < b ? a : b);
     double maxY = points.map((pt) => pt.value).reduce((a, b) => a > b ? a : b);
 
-    // The whole point of a "relative" graph: zoom into the actual range of
-    // values instead of forcing the axis down to ₹0, where a normal day's
-    // fluctuation would be an invisible sliver against a 20-30k baseline.
     if ((maxY - minY).abs() < 1) {
       minY -= 50;
       maxY += 50;

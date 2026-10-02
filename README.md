@@ -1,366 +1,319 @@
-# Expense_tracker
+# Expense Tracker
 
-This is a small Android app that watches for Bank debit SMS and turns
-them into a running ledger, without ever touching the internet. Everything
-below explains why it's built the way it is, exactly how it behaves, and
-where the rough edges are.
+An Android application that reads HDFC Bank debit SMS and turns them into a
+running ledger, without a network connection of any kind. This document
+explains what the app does, why it's built the way it is, how its data
+safety mechanisms work, and how to build and run it. If you're looking for
+a history of changes rather than current behavior, see `CHANGELOG.md`.
 
-## The idea behind it
+## Why it works this way
 
-Most expense trackers ask you to either photograph receipts, connect your
-bank account through a third-party aggregator, or manually log every rupee
-you spend. All three are friction, and the middle one hands your financial
-data to a company you've never heard of. But your bank is already texting
-you every time money leaves your account. This app just reads that text.
-
-That constraint shapes everything else about it. If the app only ever needs
-to react to an SMS as it arrives, it doesn't need a background service
-burning battery, it doesn't need your inbox history, and it definitely
-doesn't need a network connection. So it has none of those. The whole thing
-is a SQLite file on your phone and a broadcast receiver that wakes up for a
-fraction of a second whenever a new message comes in.
+Your bank already texts you every time money leaves your account. This app
+reads that text instead of asking you to photograph receipts, manually log
+spending, or connect your account through a third-party aggregator that
+has no reason to see your financial data. That one decision drives almost
+everything else about the design: if the app only ever needs to react to a
+single SMS as it arrives, it doesn't need a background service, it doesn't
+need your inbox history, and it has no reason to touch a network at all.
+It's a SQLite file and a broadcast receiver that wakes up for a fraction of
+a second when a message comes in, and nothing else.
 
 ## Confirming there's no internet involved
 
-Rather than just asserting this, here's how to check it yourself:
+Rather than asking you to take this on faith: `AndroidManifest.xml`
+declares `RECEIVE_SMS` as its only permission in normal builds (see
+"Build variants" below for the one exception). There is no `INTERNET`
+permission anywhere, and Android does not allow an app to open a network
+socket without it — this isn't a setting that could be quietly changed
+later; the manifest would have to be edited and the app rebuilt.
+`pubspec.yaml` lists three dependencies — `sqflite`, `path`, `intl` — none
+of which talk to a server. A search of every `.dart` and `.kt` file in the
+project for anything network-shaped turns up nothing except the XML
+namespace URL every Android manifest includes by convention, which is an
+identifier string, not a request. The one caveat: `flutter run` itself
+talks to your computer over USB for hot reload during development. That's
+Flutter's tooling, not the app, and it stops applying the moment you
+install a built APK instead.
 
-- `android/app/src/main/AndroidManifest.xml` declares exactly one
-  permission — `RECEIVE_SMS`. There is no `INTERNET` permission anywhere in
-  the manifest, and Android will not let an app open a socket without it,
-  full stop. This isn't a setting that could quietly get flipped later —
-  the permission would have to be added back to the manifest and the app
-  rebuilt for that to even become possible.
-- `pubspec.yaml` lists three dependencies: `sqflite` (a local database),
-  `path` (string manipulation for file paths), and `intl` (date and
-  currency formatting). None of them talk to a server.
-- A search through every `.dart` and `.kt` file in this project for
-  anything network-shaped — `http`, `Socket`, `WebView`, Firebase,
-  analytics SDKs — turns up nothing except the XML namespace URL that
-  every single Android manifest file includes by convention (it's an
-  identifier string, not a request).
+## How the SMS pipeline works
 
-The one caveat: while you're actively developing with `flutter run`, your
-computer and phone talk to each other over USB or Wi-Fi so you can hot
-reload — that's Flutter's tooling, not the app, and it stops mattering the
-moment you build a release APK and install that instead.
+When a text arrives, Android broadcasts `SMS_RECEIVED` system-wide. This
+app has a manifest-registered receiver for that broadcast, which Android
+will deliver even if the app hasn't been opened in weeks — there's no
+polling and nothing resident in memory between messages.
 
-## How the SMS pipeline actually works
-
-When a text message arrives, Android broadcasts `SMS_RECEIVED` system-wide.
-This app has a receiver registered for that broadcast in the manifest,
-which means Android will wake the app's process for just long enough to
-handle it, even if you haven't opened the app in weeks — there's no polling
-loop and no persistent service sitting in memory the rest of the time.
-
-The receiver checks whether the sender ID contains a marker string (by
-default `HDFCBK`, matching the pattern Indian carriers use for bank sender
-IDs like `TX-HDFCBK-S` or `VM-HDFCBK`). If it matches, the message body gets
-tested against a regular expression that expects something like:
+The receiver checks whether the sender ID contains a configurable marker
+string (`HDFC` by default). If it matches, the message body is tested
+against a regular expression expecting something like:
 
 ```
-Sent 145.00 From HDFC Bank A/C x0889 To ABC On 16/08/25
+Sent 145.00 From HDFC Bank A/C x0889 To BOTTLE LAB TECHNOLOGIES P On 16/08/26
 ```
 
-The pattern pulls out the amount and the receiver name as capture groups
-and ignores everything else in the message. If a message from a matching
-sender doesn't fit the pattern — an OTP, a balance alert, a promotional
-text — it gets logged to the Unparsed Messages screen instead of silently
-vanishing, so you can see what's being missed.
+The amount and the receiver name are pulled out as capture groups; anything
+else in the message is ignored. A message from a matching sender that
+doesn't fit the pattern is logged rather than dropped, so you can see what
+didn't get tracked and why.
 
-Long messages that Android splits into multiple SMS parts get reassembled
-into one message before parsing (grouped by sender and timestamp), so a
-single transaction never gets parsed twice from its own fragments. And
-every successfully parsed entry gets a fingerprint built from the sender,
-the SMS's own timestamp, the amount, and the receiver name; that
-fingerprint has a uniqueness constraint in the database, so if Android ever
-redelivers the same broadcast — which does happen occasionally on some
-phones — the duplicate gets silently dropped rather than logged twice.
+Long messages split by the carrier into multiple SMS parts are reassembled
+before parsing. Every transaction derived from an SMS carries a fingerprint
+built from the sender, the SMS's own timestamp, the amount, and the
+receiver, enforced as unique in the database — if Android ever redelivers
+the same broadcast, which does happen occasionally, the duplicate is
+dropped rather than recorded twice.
 
-The date and time recorded for an SMS-derived entry comes from the SMS
-itself, not from whenever the app happened to process it. That's also why,
-if you edit one of these entries later, the date field is locked — it's
-meant to be a fact about when the bank moved the money, and letting it
-drift would undermine the one piece of ground truth the whole system is
-built on. The amount and the receiver name on that same entry, though, are
-completely editable, since those are things you might reasonably want to
-correct or clean up.
+The date and time on an SMS-derived entry come from the SMS itself, not
+from whenever the app got around to processing it, and that field is
+locked from editing for exactly that reason — it's meant to be a fact
+about when the bank moved the money. The amount and receiver name on the
+same entry remain fully editable.
 
 ## Previous Expense — the anchor entry
 
-Every fresh install seeds one entry called "Previous Expense," set to
-₹0.00. It's not a real transaction; it's a placeholder for however much you
-already owe or have saved that predates this app's tracking. If you start
-using this the day you get your salary and your account is otherwise at
-zero, you can leave it alone. If you've been spending for a while and want
-the running total to reflect reality, open it from the entry list and set
-its amount to whatever your account actually holds (or owes) right now.
+Every install starts with one entry, "Previous Expense," set to ₹0.00. It
+represents whatever your account held before this app started tracking.
+If you're starting from zero, leave it alone; if you've been spending for a
+while, set it to whatever your account actually holds.
 
-This entry also does something less obvious: it's the container that
-absorbs history once the app's 200-entry cap kicks in. The app keeps the
-most recent 200 transactions in full detail — receiver name, exact SMS
-text, timestamp, all of it — and once a 201st comes in, the oldest one gets
-folded away. But "folded away" doesn't mean deleted from your total; its
-amount gets added into Previous Expense, so the running sum across all your
-entries stays exactly the same. You lose the ability to see that one old
-transaction's details, but you never lose track of the money. This is why
-the entry can't be deleted from the app, even though everything about it —
-the amount, its date, even its label — can be edited freely.
+It also absorbs history as the entry cap (below) prunes old transactions —
+when an entry is pruned, its amount is added into this one, so the
+all-time total is never affected by pruning, even though the individual
+transaction's detail is gone. This is also why the entry can't be deleted:
+the pruning mechanism depends on it always existing.
 
-## The 200-entry cap
+## The 300-entry cap
 
-If you want to see further back than that, the Previous Expense entry's date tells you when
-the oldest visible entry starts mattering, and everything before it is
-already accounted for in that one number.
+The app keeps the most recent 300 transactions in full detail and folds
+anything older into Previous Expense as described above. 300 is a size
+chosen to keep the database small and the app fast without real upkeep;
+it has no particular significance beyond that.
 
 ## The forms in the app
 
-**Adding or editing an entry.** Every entry — however it was created — has
-an amount, a debit/credit toggle, a receiver name, and a date. Debit means
-money left your account and counts as positive; credit means money came in
-and counts as negative. For a manual entry you're free to set the date to
-anything in the past, since you're usually logging something that already
-happened. Editing an existing entry asks you to confirm before saving,
-since it's easy to fat-finger a digit on a phone screen. Deleting works the
-same way, with its own confirmation, and is available from the edit screen
-itself as well as by swiping an entry left on the home list.
+**Entries.** Every entry, however it was created, has an amount, a
+debit/credit toggle, a receiver name, and a date (locked for SMS-derived
+entries, as above; free for manual and anchor entries, including dates up
+to five years in the future, which is deliberately permissive — forward
+budgeting isn't something the app tries to prevent). Editing or deleting an
+existing entry asks for confirmation first.
 
-**Rename rules.** These let you map a receiver name exactly as it appears
-in the SMS to something you'd rather see — the default rule turns "BOTTLE
-LAB TECHNOLOGIES P" into "Lunch," which was presumably a specific café at
-some point. Add a rule with the exact original name and whatever you want
-it replaced with, and optionally have it applied retroactively to entries
-that already exist. New SMS get renamed automatically going forward.
+**Rename rules.** Map a receiver name exactly as it appears in the SMS to
+whatever you'd rather see — the default turns `BOTTLE LAB TECHNOLOGIES P`
+into `Lunch`. Rules can be applied retroactively to existing entries.
 
-**Parser settings.** This is the one that lets you adapt the whole system
-to a different bank or a different message format, if HDFC ever changes
-theirs or you want to track a second account. There are two fields: which
-string the sender ID has to contain, and the regular expression the
-message body has to match. The regex needs its first capture group to be
-the amount and its second to be the receiver — anything else in the
-message is ignored. There's a test box on the same screen where you can
-paste a real (or made-up) SMS and see exactly what the current pattern
-would extract, before you commit to it. Worth knowing: this test box runs
-on Dart's regex engine for the live preview, while the phone itself parses
-incoming SMS using Kotlin's regex engine. They agree on essentially
-everything a normal pattern would use, but if you're doing something
-unusual with the syntax, it's worth double-checking against a real message
-afterward via the Unparsed Messages screen. Also worth knowing: if you set
-the sender filter too broadly — a single common letter, for instance —
-you'll start catching messages from unrelated senders, so keep it as
-specific as the actual sender IDs you're trying to match. If a saved
-pattern ever fails to compile on the phone for some reason, the app quietly
-falls back to the built-in HDFC default rather than going dark, and leaves
-a note about it in Unparsed Messages so you know to go fix it.
+**Parser settings.** The sender filter and the parsing regex are both
+editable here, with a test box that shows what the current pattern
+extracts from a pasted sample before you commit to it. The regex needs its
+first capture group to be the amount and its second to be the receiver; a
+pattern that fails to compile on-device falls back to the built-in default
+rather than silently halting tracking, and a note is logged when that
+happens. This screen also shows the last time the receiver observed any
+SMS at all, independent of whether that message was tracked — useful for
+telling apart "nothing is arriving" from "things are arriving but not
+parsing."
 
 ## The trend graph
 
-This shows a line — your cumulative running total over time — for
-whichever window you pick: today, this week, this month, this year,
-everything, or a custom range. The line always starts at whatever your
-account had already accumulated going into that window, which is really
-just the same "start at previous expenses" idea from the anchor entry
-applied to a shorter timeframe. A week view doesn't start at zero; it
-starts wherever last week left off.
+A cumulative running-total line, for Today / Week / Month / Year / All /
+Custom. The line starts wherever the account's balance already stood going
+into that window and only plots real entries — it never draws a flat line
+out to the edges of the selected range or invents data between the last
+real entry and the present moment. The Y-axis is scaled to the actual
+values in the selected window rather than a fixed ₹0 baseline, since a
+fixed baseline would flatten realistic daily movement against a much
+larger running total.
 
-The Y-axis is deliberately not anchored to ₹0. If your balance genuinely
-sits around ₹25,000 and moves by a few hundred rupees a day, forcing the
-axis to span from zero would flatten every real fluctuation into a
-barely-visible wobble near the top of the chart — not something a phone
-screen has the vertical pixels to show meaningfully anyway. Instead the
-axis zooms to whatever range your actual values cover in that window, with
-a bit of padding on top and bottom. This means the same ₹500 swing will
-look dramatic in a "Today" view and barely noticeable in an "All time"
-view, which is exactly the point — read the axis labels, not just the
-shape of the line, when you're comparing across different windows.
+## Database naming and versioning
 
-One thing that trips people up: the total shown on the home screen and the
-ending value of the trend graph for the same period aren't always the same
-number, and that's intentional. The home screen's total is "how much
-happened in this specific window" — it only counts entries whose date
-falls inside the selected range. The trend graph's ending value is "what
-was my running balance by the end of this window" — it includes everything
-that came before, via the baseline. They're answering two different
-questions.
+The SQLite filename is not fixed. It's generated as
+`expense_tracker_<versionName>.db`, where `<versionName>` is read directly
+from the app's own installed package metadata (the `versionName` field in
+`android/app/build.gradle.kts`) at the moment the database is opened. The
+Dart side asks the native side for this filename over a platform channel
+rather than keeping its own separately-maintained copy of the version
+string, specifically so the two sides cannot disagree about which file to
+open.
+
+The practical effect: if a version bump results in Android updating the
+app in place, the previous version's database file is left exactly where
+it was, untouched, because the new version is looking for a differently
+named file. You keep both on disk, and nothing auto-migrates between them
+without you doing it deliberately (see "Recovering data" below).
+
+Be clear-eyed about what this does and doesn't protect against. It only
+helps when the OS performs an in-place update. A full uninstall — whether
+triggered by you, by a signing-certificate mismatch between builds (see
+"Build signing" below), by "Clear storage" in Android's app settings, or
+by a factory reset — wipes the entire private storage directory regardless
+of what any file inside it is named. Filename versioning is a convenience
+for the common case, not a backup strategy. The next section is the actual
+backup strategy.
+
+## Backups and recovering data
+
+**Automatic daily backup.** At most once per calendar day, the app makes a
+clean snapshot of its live database using SQLite's own `VACUUM INTO`
+command — this guarantees the snapshot can never be a half-written or
+corrupt copy, regardless of what the app was doing at the moment the
+backup ran — and copies that snapshot to your phone's public Downloads
+folder as `expense_tracker_daily_backup.db`. Downloads is genuinely outside
+the app's private storage, so this file survives even a full uninstall.
+The check runs both when the app is opened and whenever the SMS receiver
+fires, so a backup can still happen on a day the app itself is never
+opened.
+
+**Manual export.** Parser Settings has an "Export now" button that performs
+the same `VACUUM INTO` snapshot on demand, saved to Downloads under a
+timestamped filename so repeated exports never overwrite one another. Use
+this immediately before anything that might risk the app's storage — a
+version bump, a rebuild after dependency or Gradle changes, switching
+build flavors — rather than relying solely on the daily schedule.
+
+**Pulling a backup off the phone.** If you need the file on your computer,
+use `adb exec-out`, not `adb shell`:
+```
+adb exec-out run-as com.expensetracker.hdfc cat databases/<filename>.db > local_copy.db
+```
+`adb shell` (without `exec-out`) pipes its output through a pseudo-terminal
+that rewrites certain byte sequences — harmless for text, but it corrupts
+binary files like a SQLite database. This cost real data during
+development before the cause was identified. Files already in Downloads
+(daily backups, manual exports) don't need `run-as` at all — they're public
+storage, so a plain `adb pull` works.
+
+**Restoring a backup into a running install.** The database filename
+depends on the installed `versionName`, so a restored file has to be
+renamed to match whatever the current build expects:
+```
+adb shell am force-stop com.expensetracker.hdfc
+adb push your_backup.db /data/local/tmp/expense_tracker_<versionName>.db
+adb shell run-as com.expensetracker.hdfc mkdir -p databases
+adb shell run-as com.expensetracker.hdfc cp /data/local/tmp/expense_tracker_<versionName>.db databases/expense_tracker_<versionName>.db
+adb shell rm /data/local/tmp/expense_tracker_<versionName>.db
+adb shell am start -n com.expensetracker.hdfc/.MainActivity
+```
+Force-stopping first matters — it ensures nothing holds the database file
+open while you overwrite it underneath the running process.
+
+## Recovery tooling (Import from SMS)
+
+A separate, deliberately isolated screen exists for the case where
+transactions were missed or data needs reconstructing from scratch: it
+scans the device's SMS inbox directly — not just new arrivals — for any
+message containing "HDFC," regardless of sender, across a chosen date
+range, and runs each one through the same parsing logic the live receiver
+uses. Anything already present is skipped automatically by the existing
+uniqueness constraint, so running the scan again over an overlapping range
+never creates duplicates.
+
+This requires `READ_SMS`, a materially broader grant than the app's normal
+`RECEIVE_SMS` — it can read the entire inbox, not just react to new
+messages. Because that's a real increase in what the app can see, it's
+walled off at the build level rather than simply hidden behind a UI toggle:
+
+## Build variants
+
+The project defines two Gradle product flavors, sharing one application
+ID:
+
+- **`standard`** — the day-to-day build. Declares only `RECEIVE_SMS`.
+  `READ_SMS` does not exist anywhere in this build's compiled manifest.
+- **`recovery`** — adds `READ_SMS` via a flavor-specific manifest fragment,
+  and exposes the Import from SMS screen when also built with
+  `--dart-define=ENABLE_SMS_IMPORTER=true`.
+
+Once any flavor is defined, Gradle requires one to be specified on every
+build — there is no longer a flavor-less `flutter run`:
+```
+flutter run --flavor standard
+flutter run --flavor recovery --dart-define=ENABLE_SMS_IMPORTER=true
+```
+Use `standard` unless you specifically need the import tool.
+
+## Build signing
+
+By default, `flutter run` signs the app with a debug key that Android's
+tooling generates automatically on your machine. That key is not
+guaranteed to stay fixed — it can change across a toolchain reinstall, a
+different machine, or other environment changes — and if it does, the next
+build's signature no longer matches what's installed, which forces Android
+to uninstall before reinstalling, wiping all app data as a side effect.
+This is believed to be the root cause of a real data-loss incident during
+development (see `CHANGELOG.md`, Section 10).
+
+The project optionally supports a stable, self-managed keystore
+(`android/key.properties`, excluded from version control) that both the
+debug and release build types sign with when present, so the signature
+stays identical across machines and over time regardless of what happens
+to any individual machine's auto-generated debug key. If `key.properties`
+is absent, the build falls back to normal Android Gradle Plugin defaults
+without issue — this is an optional hardening step, not a requirement to
+build the project.
+
+If you set this up: back up the `.jks` file itself in more than one place.
+Losing it doesn't put your data at risk — the backup mechanisms above are
+independent of signing entirely — but it does mean the next build after
+that point will itself be a one-time forced reinstall, since a replacement
+keystore is, by definition, a different signature.
 
 ## Known limitations
 
-A few things worth knowing about rather than being surprised by:
+**Receiver names cut short at a fixed length are not a bug in this app.**
+Investigation (comparing the stored receiver name against the original SMS
+text, which is viewable on an SMS-derived entry's edit screen) confirmed
+that some payee names arrive already truncated inside the bank's own SMS.
+The full name was never present in the source message, and no parsing
+change can recover text that wasn't sent.
 
-If two genuinely different SMS from the same sender arrive in the exact
-same millisecond, they'd get treated as fragments of one multi-part
-message and concatenated before parsing, which would break the parse for
-both. This is an extremely narrow window and hasn't come up in testing,
-but it's a real corner case given how the multi-part reconstruction works.
+**OEM background restrictions can silently stop SMS from being tracked.**
+Some Android manufacturers — Samsung, Xiaomi, and others are commonly
+reported — apply their own background-process limits on top of stock
+Android, independent of whether `RECEIVE_SMS` is granted. If tracking
+stops after the app hasn't been opened for a while, check your device's
+battery optimization and autostart settings for this app specifically; this
+is outside anything the app itself can control.
 
-All timestamps are stored in the phone's local time at the moment the SMS
-arrived, with no timezone metadata attached. If you travel across time
-zones, older entries will still display in whatever local time they were
-recorded in, not adjusted for wherever you are now.
+**Timestamps carry no timezone metadata**, stored as local time at the
+moment of arrival. Entries logged before a timezone change will not
+retroactively adjust.
 
-Some phone manufacturers — MIUI and ColorOS are the usual suspects — are
-aggressive about killing background processes they consider inactive, and
-that can interfere with broadcast delivery to apps you haven't opened
-recently. If SMS stop being picked up after the app's been idle a while,
-check your phone's battery optimization settings and exclude this app from
-them. This is a manufacturer-level restriction; there's no way to code
-around it from inside the app.
+**The Parser Settings test box and the live receiver use different regex
+engines** (Dart's for the in-app preview, Kotlin's on-device). They agree
+on virtually any pattern an ordinary person would write; if you're doing
+something unusual with the syntax, confirm against a real message
+afterward via the activity log rather than trusting the preview alone.
 
-The parser settings put real power in your hands, which also means real
-ways to misconfigure it — an overly broad sender match or a regex with the
-wrong capture groups will produce garbage entries or silently miss real
-ones. The test box exists specifically to let you check before you commit.
+## Security posture, summarized
 
-## Security choices, summarized
-
-Only one permission is ever requested (`RECEIVE_SMS`), and it's requested
-through a purpose-built platform channel rather than a bundled "SMS
-permissions" plugin that would ask for read and send access too. The
-manifest receiver requires the sender to hold `BROADCAST_SMS`, which only
-the operating system itself holds, so no other app can forge a fake SMS
-broadcast to inject fabricated entries. `allowBackup` is turned off, so
-your financial data doesn't end up in `adb backup` or automatic cloud
-backups. And as covered above, there's no networking capability anywhere
-in the app for any of this to leak through even if something else went
-wrong.
-
----
+One permission in normal builds (`RECEIVE_SMS`), requested through a
+purpose-built platform channel rather than a bundled plugin that would ask
+for more than this app needs. The manifest receiver requires the sender to
+hold `BROADCAST_SMS`, which only the operating system holds, so no other
+app can forge a fake SMS broadcast into this one. `allowBackup` is
+disabled, keeping data out of `adb backup` and automatic cloud backup. No
+networking capability exists anywhere in the app for anything to leak
+through even if something else went wrong.
 
 ## Setup
 
-You need three things on your **computer** (not your phone): the Flutter
-SDK, Android Studio, and a way to test on an actual device.
-
-### Windows
-
-1. Download the Flutter SDK from
-   `https://docs.flutter.dev/get-started/install/windows` and extract it
-   somewhere with no spaces in the path — `C:\src\flutter`, not
-   `C:\Program Files\`.
-2. Add `C:\src\flutter\bin` to your PATH (Windows key → "env" → "Edit the
-   system environment variables" → Environment Variables → Path → Edit →
-   New).
-3. Close and reopen any terminal windows.
-4. Install Android Studio from `https://developer.android.com/studio`,
-   accepting the defaults (this installs the Android SDK and emulator
-   support too).
-5. In a new PowerShell window, run `flutter doctor`. If it complains about
-   licenses, run `flutter doctor --android-licenses` and accept them.
-
-### macOS
-
-1. `brew install --cask flutter` (install Homebrew from `https://brew.sh`
-   first if you don't have it), or download manually from
-   `https://docs.flutter.dev/get-started/install/macos`.
-2. Install Android Studio from `https://developer.android.com/studio`.
-3. Run `flutter doctor` in Terminal and fix anything it flags, including
-   `flutter doctor --android-licenses` if needed.
-
-### Linux
-
-1. Download the SDK tarball from
-   `https://docs.flutter.dev/get-started/install/linux`, extract it (e.g.
-   to `~/development/flutter`), and add
-   `export PATH="$PATH:$HOME/development/flutter/bin"` to `~/.bashrc`.
-2. Install Android Studio and run through its setup wizard.
-3. Run `flutter doctor` and resolve anything flagged.
-
-Don't move on until `flutter doctor` shows the Flutter and Android
-toolchain checks passing.
-
-### Getting a device to test on
-
-The whole point of this app is reading real bank SMS, so you'll eventually
-want a real phone — emulators can't receive genuine carrier messages, only
-ones you inject yourself for testing.
-
-For a real phone: enable Developer Options (Settings → About phone → tap
-Build number seven times), turn on USB debugging under Developer Options,
-plug it in, and approve the debugging prompt that appears on the phone.
-`flutter devices` should then list it.
-
-For an emulator: Android Studio → Virtual Device Manager → Create device,
-pick any profile and system image. Once it's running, you can simulate a
-test SMS with:
-```
-adb emu sms send HDFCBK "Sent 145.00 From HDFC Bank A/C x0889 To BOTTLE LAB TECHNOLOGIES P On 16/08/26 Not you? Call 1800..."
-```
-
-### Building the project
-
-The zip you have contains the customized files (`lib/`, the manifest, the
-Kotlin sources) but not the generic Flutter boilerplate, which only
-`flutter create` can generate correctly for your machine. From a terminal,
-in whatever folder you want the project to live next to your unzipped
-`Expense_tracker` folder:
+You need the Flutter SDK, Android Studio (for the Android SDK and an
+emulator), and a way to test on a device. Full platform-by-platform
+installation steps are in `CHANGELOG.md`'s companion setup notes if you're
+starting from nothing; the short version, once Flutter and Android Studio
+are installed and `flutter doctor` is clean:
 
 ```
-flutter create --org com.expensetracker --project-name expense_tracker expense_tracker_app
-```
-
-Then copy the customized files on top of the placeholders it generated:
-
-**macOS / Linux:**
-```
-cp -R Expense_tracker/lib/. expense_tracker_app/lib/
-cp Expense_tracker/pubspec.yaml expense_tracker_app/pubspec.yaml
-cp Expense_tracker/android/app/src/main/AndroidManifest.xml expense_tracker_app/android/app/src/main/AndroidManifest.xml
-rm -rf expense_tracker_app/android/app/src/main/kotlin/com/expensetracker
-cp -R Expense_tracker/android/app/src/main/kotlin/com/expensetracker expense_tracker_app/android/app/src/main/kotlin/com/
-```
-
-**Windows (PowerShell):**
-```
-Copy-Item -Recurse -Force Expense_tracker\lib\* expense_tracker_app\lib\
-Copy-Item -Force Expense_tracker\pubspec.yaml expense_tracker_app\pubspec.yaml
-Copy-Item -Force Expense_tracker\android\app\src\main\AndroidManifest.xml expense_tracker_app\android\app\src\main\AndroidManifest.xml
-Remove-Item -Recurse -Force expense_tracker_app\android\app\src\main\kotlin\com\expensetracker
-Copy-Item -Recurse -Force Expense_tracker\android\app\src\main\kotlin\com\expensetracker expense_tracker_app\android\app\src\main\kotlin\com\
-```
-
-Open `expense_tracker_app/android/app/build.gradle` and set
-`namespace "com.expensetracker.hdfc"` inside the `android { }` block, and
-`applicationId "com.expensetracker.hdfc"` inside `defaultConfig { }`
-(alongside `minSdk 23`, `compileSdk 34`, `targetSdk 34`).
-
-Then:
-```
-cd expense_tracker_app
 flutter pub get
-flutter run
+flutter run --flavor standard
 ```
 
-Tap Grant on the orange permission banner the first time the app opens —
-that's the only thing it will ever ask you for.
+Grant SMS permission when prompted on first launch — that, plus `READ_SMS`
+only if you build the `recovery` flavor, is everything the app will ever
+ask for.
 
-### Building an installable APK
-
-Once `flutter run` works, `flutter build apk --release` produces a
-standalone APK at
-`expense_tracker_app/build/app/outputs/flutter-apk/app-release.apk`. Move
-that file to your phone however's convenient and open it there to install
-— you'll need to allow installs from unknown sources once, since it isn't
-coming from the Play Store.
-
-### If something breaks
-
-A build error mentioning the manifest's `package` attribute means your
-Flutter version's Android Gradle Plugin wants the namespace declared in
-`build.gradle` instead — remove `package="com.expensetracker.hdfc"` from
-the manifest's `<manifest>` tag if it's still there, and confirm `namespace`
-is set in `build.gradle` as described above.
-
-A `no such table` error on a phone that already had the app installed
-before means the database needs a migration, not a fresh install — check
-that `dbVersion` in `db_helper.dart` and `DB_VERSION` in `ExpenseDbHelper.kt`
-have been bumped together, with a matching `onUpgrade` block that adds
-whatever table went missing, rather than deleting and reinstalling (which
-would work but throws away your existing entries for no reason).
-
-If SMS stop being tracked after the app hasn't been opened in a while,
-check your phone's battery optimization settings for this app, as
-mentioned above.
-
-If entries never appear at all, confirm you tapped Grant on the permission
-banner, and check the Unparsed Messages screen — if messages are showing
-up there, the sender filter is working but the pattern isn't matching, and
-Parser Settings is where to fix that.
+To produce an installable APK:
+```
+flutter build apk --flavor standard --release
+```
+found afterward at
+`build/app/outputs/flutter-apk/app-standard-release.apk`.
